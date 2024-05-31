@@ -1,0 +1,106 @@
+#!/usr/bin/env perl
+##############################################################################
+#
+#   File Name    - git-renumber-files
+#
+#   Description  - Takes a series of MarkDown chapters in files given on the
+#                  command line Git renames them to rebalance the section
+#                  numbers.
+#
+##############################################################################
+#^L
+##############################################################################
+#
+#   Global Data For This Module
+#
+##############################################################################
+
+
+
+# ***** DIRECTIVES *****
+
+use strict;
+use warnings;
+
+# ***** GLOBAL DATA DECLARATIONS *****
+
+# A constant for the temporary file renaming prefix to use.
+
+use constant RENAME_PREFIX => "__RENAME__";
+#^L
+##############################################################################
+#
+#   Routine      - Main Body Of Code
+#
+#   Description  - This is the main body of code for the git-renumber-files
+#                  program.
+#
+#   Data         - @_           : The command line arguments.
+#                  Return Value : Unix exit code.
+#
+##############################################################################
+
+
+
+{
+
+    # Get a sorted list of files to process from the command line. These must
+    # match a specific pattern.
+
+    my @md_files;
+    foreach my $fname (@ARGV)
+    {
+        if ($fname =~ m/^Chapter(\d{2})(\d{1,2})-.*\.md$/)
+        {
+            push(@md_files, {old_name => $fname,
+                             new_name => undef,
+                             chapter  => $1,
+                             section  => $2});
+        }
+    }
+
+    # Rename in memory and rename the disk file out of the way.
+
+    my $chapter = -1;
+    my $last_chapter = -1;
+    my $section;
+    foreach my $md_file (@md_files)
+    {
+        if ($md_file->{chapter} != $last_chapter)
+        {
+            ++ $chapter;
+            $last_chapter = $md_file->{chapter};
+            $section = 0;
+        }
+        ++ $section;
+        my $suffix = ".md";
+        if ($md_file->{old_name} =~ m/^Chapter\d{3,4}(-.*)$/)
+        {
+            $suffix = $1;
+        }
+        $md_file->{new_name} = sprintf("Chapter%02u%02u%s",
+                                       $chapter,
+                                       $section,
+                                       $suffix);
+        system("git",
+               "mv",
+               $md_file->{old_name},
+               RENAME_PREFIX . $md_file->{old_name});
+    }
+
+    # Now rename them to their new names.
+
+    foreach my $md_file (@md_files)
+    {
+        printf("Renaming %s -> %s\n",
+               $md_file->{old_name},
+               $md_file->{new_name});
+        system("git",
+               "mv",
+               RENAME_PREFIX . $md_file->{old_name},
+               $md_file->{new_name});
+    }
+
+    exit(0);
+
+}

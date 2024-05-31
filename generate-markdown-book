@@ -1,0 +1,488 @@
+#!/usr/bin/env perl
+##############################################################################
+#
+#   File Name    - generate-markdown-book
+#
+#   Description  - Takes a series of MarkDown chapters in files given on the
+#                  command line and generates a complete book with a table of
+#                  contents that works with BitBucket. The resultant book is
+#                  written to STDOUT.
+#
+#   Author       - A.E.Cooper.
+#
+#   Legal Stuff  - Copyright (c) 2024 Anthony Edward Cooper
+#                  <aecooper@cpan.org>.
+#
+#                  This program is free software; you can redistribute it
+#                  and/or modify it under the terms of the GNU General Public
+#                  License as published by the Free Software Foundation;
+#                  either version 3 of the License, or (at your option) any
+#                  later version.
+#
+#                  This program is distributed in the hope that it will be
+#                  useful, but WITHOUT ANY WARRANTY; without even the implied
+#                  warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
+#                  PURPOSE. See the GNU General Public License for more
+#                  details.
+#
+#                  You should have received a copy of the GNU General Public
+#                  License along with this software; if not, write to the Free
+#                  Software Foundation, Inc., 59 Temple Place - Suite 330,
+#                  Boston, MA 02111-1307 USA.
+#
+##############################################################################
+#^L
+##############################################################################
+#
+#   Global Data For This Module
+#
+##############################################################################
+
+
+
+# ***** DIRECTIVES *****
+
+use feature "state";
+use strict;
+use warnings;
+
+# ***** REQUIRED PACKAGES *****
+
+# Standard Perl modules.
+
+use Cwd;
+use File::Spec;
+use File::Temp;
+use IO::File;
+use POSIX qw(strftime);
+
+# ***** GLOBAL DATA DECLARATIONS *****
+
+# A map for detecting duplcate section names.
+
+my %sections_map;
+
+# The table of contents that builds up during scanning.
+
+my @toc;
+
+# A list of issues found during the parsing and processing.
+
+my @issues;
+#^L
+##############################################################################
+#
+#   Routine      - get_version
+#
+#   Description  - Try to find the VERSION.txt file in the current workspace
+#                  and return the version number contained within.
+#
+#   Data         - Return Value : A string containing the version numder on
+#                                 success, otherwise undef on failure.
+#
+##############################################################################
+
+
+sub get_version()
+{
+
+    for (my $dir = Cwd::realpath(".");
+         $dir ne File::Spec->rootdir();
+         $dir = Cwd::realpath(File::Spec->catfile($dir, File::Spec->updir())))
+    {
+        my $version_file = File::Spec->catfile($dir, "VERSION.txt");
+        if (-f $version_file and -d File::Spec->catdir($dir, ".git"))
+        {
+            defined(my $file = IO::File->new($version_file, "r"))
+                or die("IO::File->new() failed with: $!");
+            my $version = $file->getline();
+            chomp($version);
+            $file->close();
+            return $version;
+        }
+    }
+
+    return;
+
+}
+#^L
+##############################################################################
+#
+#   Routine      - generate_unique_ref
+#
+#   Description  - Try to produce a unique HTML reference id from the
+#                  specified section level numbers and title.
+#
+#   Data         - $title       : A string containing the section title.
+#                  @levels      : A list of section numbers in the hierarchy
+#                                 for the specified section.
+#                  Return Value : A string containing the reference id.
+#
+##############################################################################
+
+
+
+sub generate_unique_ref($@)
+{
+
+    my ($title, @levels) = @_;
+
+    # Munge into a suitable reference id, prepending with chapter/section ids if
+    # necessary.
+
+    $title =~ s/[^A-Z-a-z0-9-]/-/g;
+    $title = lc($title);
+    my $id = $title;
+    my $prefix = "";
+    my $section_nr;
+    while (exists($sections_map{$id}) and defined($section_nr = shift(@levels)))
+    {
+        $prefix .= $section_nr;
+        $id = $prefix . "-" . $title;
+    }
+    if (exists($sections_map{$id}))
+    {
+        die("Duplicate unrecoverable section detected `" . $id . "'");
+    }
+    $sections_map{$id} = undef;
+
+    # Log any issues.
+
+    if ($prefix ne "")
+    {
+        push(@issues,
+             sprintf("- Duplicate section titles:\n"
+                         . "  Section reference renamed\n"
+                         . "      from: `%s'\n"
+                         . "        to: `%s'\n"
+                         . "  in order avoid ambiguity.\n"
+                         . "  Renaming uses the section number hierarchy and "
+                             . "so may change in the future.\n"
+                         . "  So make sure to check any references to this "
+                             . "section in your document.",
+                     $title,
+                     $id));
+    }
+
+    return $id;
+
+}
+#^L
+##############################################################################
+#
+#   Routine      - process_sections
+#
+#   Description  - Process the specified input file into the specified output
+#                  file. Sections are identified, formatted with a reference
+#                  id and their details stored in the internal @toc list.
+#
+#   Data         - $input  : A handle to the input file.
+#                  $output : A handle to the output file.
+#
+##############################################################################
+
+
+
+sub process_sections($$)
+{
+
+    my ($input, $output) = @_;
+
+    state $first_chapter = 1;
+    state $last_line_was_empty = 1;
+    state @levels;
+    my $in_code_block = 0;
+
+    while (my $line = $input->getline())
+    {
+
+        # Detect `code' blocks.
+
+        if ($line =~ m/^\s*```/)
+        {
+            $in_code_block = not $in_code_block;
+        }
+
+        # Process the chapter and section headers.
+
+        if (not $in_code_block and $line =~ m/^(#+)\s+(.+)$/)
+        {
+
+            my ($hashes, $title) = ($1, $2);
+            my $nr_hashes = length($1);
+
+            $title =~ s/\s+$//g;
+
+            if ($nr_hashes == 1)
+            {
+
+                # Book title. No action.
+
+                $output->print($line);
+
+            }
+            elsif ($nr_hashes > 1)
+            {
+
+                my $level = $nr_hashes - 2;
+
+                # Chapters and below.
+
+                # Make sure that there is a blank line before sections as this
+                # can muck up the formatting when displayed.
+
+                $output->print("\n") unless ($last_line_was_empty);
+
+                # A special case is the contents chapter, we don't care about
+                # this as we don't have the contents section refer to itself.
+
+                if ($first_chapter and $level == 0
+                    and $title =~ m/^contents|table of contents$/i)
+                {
+                    $output->print($line);
+                    $first_chapter = 0;
+                }
+                else
+                {
+
+                    # Put separators in between chapters, apart from the first
+                    # one.
+
+                    if ($level == 0)
+                    {
+                        if ($first_chapter)
+                        {
+                            $first_chapter = 0;
+                        }
+                        else
+                        {
+                            $output->print("---\n\n");
+                        }
+                    }
+
+                    # Increment the current level counter and reset the counters
+                    # further down the section numbering hierarchy.
+
+                    ++ $levels[$level];
+                    for (my $i = $level + 1; $i <= $#levels; ++ $i)
+                    {
+                        $levels[$i] = 0;
+                    }
+
+                    # Format heading.
+
+                    my $format = "%u";
+                    $format .= ".%u" x $level;
+                    no warnings "redundant";
+                    my $section_prefix = sprintf($format, @levels);
+                    use warnings;
+                    my $ref = generate_unique_ref($title, @levels);
+                    $output->printf("%s %s %s <a name=\"%s\" id=\"%s\"></a>\n",
+                                    $hashes,
+                                    $section_prefix,
+                                    $title,
+                                    $ref,
+                                    $ref);
+                    push(@toc, {level          => $level,
+                                section_prefix => $section_prefix,
+                                title          => $title,
+                                ref            => $ref});
+
+                }
+
+            }
+
+        }
+        else
+        {
+
+            # A line of ordinary text or a line in a `code' block.
+
+            $output->print($line);
+
+        }
+
+        $last_line_was_empty = ($line =~ m/^\s*$/) ? 1 : 0;
+
+    }
+
+}
+##############################################################################
+#
+#   Routine      - process_tokens_and_check_links
+#
+#   Description  - Process the specified input file into the specified output
+#                  file. The [date], [toc] and [version] tokens are replaced
+#                  with the date, table of contents and project version number
+#                  respectively. Also any links within the text are checked
+#                  for validity.
+#
+#   Data         - $input  : A handle to the input file.
+#                  $output : A handle to the output file.
+#
+##############################################################################
+
+
+
+sub process_tokens_and_check_links($$)
+{
+
+    my ($input, $output) = @_;
+
+    my $in_code_block = 0;
+    my $toc_seen = 0;
+    my $version_not_found = 0;
+
+    while (my $line = $input->getline())
+    {
+
+        # Detect `code' blocks.
+
+        if ($line =~ m/^\s*```/)
+        {
+            $in_code_block = not $in_code_block;
+        }
+
+        if (not $in_code_block)
+        {
+
+            # Look for and check any links.
+
+            if ($line =~ m/\(#([^)]+)\)/)
+            {
+                my $found = 0;
+                my $ref = $1;
+                foreach my $section (@toc)
+                {
+                    if ($section->{ref} eq $ref)
+                    {
+                        $found = 1;
+                        last;
+                    }
+                }
+                if (not $found)
+                {
+                    push(@issues, "- Dangling reference `" . $ref . "' found.");
+                }
+
+            }
+
+            # Look for and process any tokens.
+
+            if ($line =~ m/^\s*\[toc\]\s*$/i)
+            {
+                foreach my $section (@toc)
+                {
+                    $output->printf("%s- [%s%s %s%s](#%s)\n",
+                                    "    " x $section->{level},
+                                    ($section->{level} == 0) ? "**" : "",
+                                    $section->{section_prefix},
+                                    $section->{title},
+                                    ($section->{level} == 0) ? "**" : "",
+                                    $section->{ref});
+                }
+                $toc_seen = 1;
+                $line = undef;
+            }
+            else
+            {
+                if ($line =~ m/\[date\]/i)
+                {
+                    my $date = strftime("%d/%m/%Y", localtime(time()));
+                    $line =~ s/\[date\]/$date/i;
+                }
+                if ($line =~ m/\[version\]/i)
+                {
+                    if (my $version = get_version())
+                    {
+                        $line =~ s/\[version\]/$version/i;
+                    }
+                    else
+                    {
+                        $version_not_found = 1;
+                    }
+                }
+            }
+
+        }
+
+        # Output the current line unless it was the TOC, which has already been
+        # output.
+
+        if (defined($line))
+        {
+            $output->print($line);
+        }
+
+    }
+
+    # Log any issues.
+
+    if (not $toc_seen)
+    {
+        push(@issues, "- No [toc] token was detected.");
+    }
+    if ($version_not_found)
+    {
+        push(@issues,
+             "- A [version] token was used but no VERSION.txt file could be "
+                 . "found at the root\n  of the Git workspace.");
+    }
+
+}
+#^L
+##############################################################################
+#
+#   Routine      - Main Body Of Code
+#
+#   Description  - This is the main body of code for the
+#                  generate-markdown-book program.
+#
+#   Data         - @_           : The command line arguments.
+#                  Return Value : Unix exit code.
+#
+##############################################################################
+
+
+
+{
+
+    # Process each file given to us in turn, writing out to a temporary file.
+
+    defined(my $tmpfile = File::Temp->new(TMPDIR => 1, UNLINK => 1))
+        or die("File::Temp->new() failed with: $!");
+    foreach my $md_file (@ARGV)
+    {
+        defined(my $input_file = IO::File->new($md_file, "r"))
+            or die("IO::File->new() failed with: $!");
+        STDERR->printf("Processing: %s\n", $md_file);
+        process_sections($input_file, $tmpfile);
+        $input_file->close();
+    }
+
+    # Now generate the table of contents and send the resultant book to STDOUT.
+
+    STDERR->print("Generating the table of contents.\n");
+    $tmpfile->seek(0, SEEK_SET);
+    print("<!---\n");
+    print("DO NOT EDIT - This file is automatically generated and will be "
+          . "overwritten.\n");
+    print("--->\n\n");
+    process_tokens_and_check_links($tmpfile, \*STDOUT);
+    $tmpfile->close();
+
+    # Tell the user of any issues.
+
+    if (@issues)
+    {
+        STDERR->printf("\nSome potential issues were detected:\n%s\n",
+                       join("\n", @issues));
+    }
+    else
+    {
+        STDERR->print("\nCompleted without any issues.\n");
+    }
+
+    exit(0);
+
+}
